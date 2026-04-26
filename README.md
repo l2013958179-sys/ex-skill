@@ -1,214 +1,199 @@
-<div align="center">
+# 朝花夕拾 AI 聊天网站
 
-# 前任.skill
+这是一个可直接部署到 Vercel 的 `Next.js + Serverless API` AI 聊天网站，当前主打：
 
-> *"从此以后，你的手机里不止有聊天记录，还有一个她。"*
+- 游客模式聊天，记录保存在浏览器 `localStorage`
+- Supabase 登录与云端同步
+- 多角色聊天
+- AI女友模式
+- 微信聊天记录导入为长期记忆
+- 图片上传理解
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://python.org)
-[![Claude Code](https://img.shields.io/badge/Claude%20Code-Skill-blueviolet)](https://claude.ai/code)
-[![AgentSkills](https://img.shields.io/badge/AgentSkills-Standard-green)](https://agentskills.io)
+## 当前能力
 
-<br>
+- `POST /api/chat`：普通流式聊天
+- `POST /api/import-chat-record`：导入 `txt / json / csv` 聊天记录并生成记忆摘要
+- `POST /api/image-chat`：图片理解聊天
+- 聊天页支持图片预览气泡
+- 设置页支持记忆管理
+- 已登录用户将聊天记录与记忆同步到 Supabase
 
-她走了，但聊天记录还在？<br>
-三年的日常，变成了手机里一个不敢点开的对话框？<br>
-你还记得她说"随便"的时候其实想吃火锅吗？<br>
-你还记得她发"哦"的时候其实在等你主动吗？<br>
+## 关键目录
 
-**将回忆蒸馏成 Skill，不是为了挽回，是为了记住。**
+- [app/page.jsx](/E:/微信小程序/codex/ex-skill/app/page.jsx:1)
+- [app/api/chat/route.js](/E:/微信小程序/codex/ex-skill/app/api/chat/route.js:1)
+- [app/api/import-chat-record/route.js](/E:/微信小程序/codex/ex-skill/app/api/import-chat-record/route.js:1)
+- [app/api/image-chat/route.js](/E:/微信小程序/codex/ex-skill/app/api/image-chat/route.js:1)
+- [components/chat-app.jsx](/E:/微信小程序/codex/ex-skill/components/chat-app.jsx:1)
+- [components/memory-manager.jsx](/E:/微信小程序/codex/ex-skill/components/memory-manager.jsx:1)
+- [components/message-input.jsx](/E:/微信小程序/codex/ex-skill/components/message-input.jsx:1)
+- [lib/chat/roles.js](/E:/微信小程序/codex/ex-skill/lib/chat/roles.js:1)
+- [lib/memory/profile.js](/E:/微信小程序/codex/ex-skill/lib/memory/profile.js:1)
+- [lib/storage/chat-local.js](/E:/微信小程序/codex/ex-skill/lib/storage/chat-local.js:1)
+- [lib/storage/user-memory.js](/E:/微信小程序/codex/ex-skill/lib/storage/user-memory.js:1)
+- [lib/supabase/chat-cloud.js](/E:/微信小程序/codex/ex-skill/lib/supabase/chat-cloud.js:1)
+- [lib/supabase/user-memory-cloud.js](/E:/微信小程序/codex/ex-skill/lib/supabase/user-memory-cloud.js:1)
+- [supabase/schema.sql](/E:/微信小程序/codex/ex-skill/supabase/schema.sql:1)
 
-<br>
+## 环境变量
 
-提供聊天记录（微信、iMessage、短信）、照片、社交媒体，加上你的主观描述<br>
-生成一个**像她一样说话的 AI Skill**<br>
-用她的语气回消息，知道她什么时候在撒娇、什么时候真的生气了
+在项目根目录创建 `.env.local`：
 
-[数据来源](#支持的数据来源) · [安装](#安装) · [使用](#使用) · [效果示例](#效果示例) · [详细安装说明](INSTALL.md) · [**English**](README_EN.md)
+```env
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+AI_API_KEY=
+AI_BASE_URL=https://api.deepseek.com/v1
+AI_MODEL=deepseek-chat
+AI_VISION_MODEL=
+```
 
-</div>
+说明：
 
----
+- `AI_MODEL`：普通文本聊天模型
+- `AI_VISION_MODEL`：支持图片理解的多模态模型；如果不配置，前端仍可上传图片，但发送时会提示“当前模型暂不支持图片理解”
 
-## 支持的数据来源
+示例文件：
 
-| 来源 | 聊天记录 | 照片 | 社交媒体 | 备注 |
-|------|:-------:|:----:|:-------:|------|
-| 微信聊天记录 | ✅ | — | — | WechatExporter 等工具导出 |
-| iMessage | ✅ | — | — | macOS chat.db 或导出文件 |
-| 短信 | ✅ | — | — | Android SMS Backup XML/CSV |
-| 照片 | — | ✅ | — | EXIF 元数据提取时间线 |
-| 微博 | — | — | ✅ | JSON 数据导出 |
-| 豆瓣 | — | — | ✅ | JSON/HTML 导出 |
-| 小红书 | — | — | ✅ | JSON 导出 |
-| Instagram | — | — | ✅ | JSON 数据导出 |
-| PDF / 图片 | ✅ | ✅ | — | 手动上传 |
-| 直接粘贴文字 | ✅ | — | — | 手动输入 |
+- [.env.local.example](/E:/微信小程序/codex/ex-skill/.env.local.example:1)
 
----
+## 微信聊天记录导入
 
-## 安装
+支持格式：
 
-### Claude Code
+- `.txt`
+- `.json`
+- `.csv`
+
+前端入口：
+
+- 聊天页中的“记忆管理”
+- 点击“导入微信聊天记录”
+
+导入流程：
+
+1. 用户上传聊天记录文件
+2. 服务端解析文本
+3. 调用 AI 生成结构化记忆
+4. 默认只保存总结后的 `memory_summary` 与各类提炼字段，不长期保留原始聊天记录
+
+当前会提取：
+
+- 用户常用称呼
+- 用户说话风格
+- 常聊话题
+- 情绪倾向
+- 生活习惯
+- 重要人物 / 事件
+- 喜欢和不喜欢的东西
+
+### 如何导出微信聊天记录
+
+这个项目本身不直接读取微信数据库，通常建议先把聊天内容整理为以下任一格式后再导入：
+
+- 手动复制聊天文本并保存为 `.txt`
+- 用你现有的导出工具整理成 `.json`
+- 把聊天行整理成 `时间,说话人,内容` 的 `.csv`
+
+建议先做一次脱敏：
+
+- 删除身份证号、手机号、住址、银行卡等敏感内容
+- 删除你无权上传的第三方隐私信息
+
+## 图片理解
+
+聊天输入框旁提供图片上传按钮，支持：
+
+- `jpg`
+- `png`
+- `webp`
+
+行为说明：
+
+- 上传后会在发送前预览
+- 发送后用户图片会显示在聊天气泡中
+- 如果已配置 `AI_VISION_MODEL`，会走 `/api/image-chat`
+- 如果未配置，会提示“当前模型暂不支持图片理解”
+
+## 记忆管理
+
+当前页面支持：
+
+- 查看 AI 当前记住了什么
+- 手动编辑记忆
+- 删除单条记忆
+- 清空所有记忆
+
+存储规则：
+
+- 未登录：记忆保存在 `localStorage`
+- 已登录：记忆保存在 Supabase `user_memories`
+
+## Supabase 表
+
+业务表：
+
+- `conversations`
+- `messages`
+- `user_memories`
+
+### user_memories
+
+- `id uuid primary key`
+- `user_id uuid`
+- `memory_type text`
+- `content text`
+- `source text`
+- `created_at timestamp`
+- `updated_at timestamp`
+
+执行 SQL：
+
+- [supabase/schema.sql](/E:/微信小程序/codex/ex-skill/supabase/schema.sql:1)
+
+它现在会同时创建：
+
+- 聊天表
+- 记忆表
+- 索引
+- 授权
+- RLS 策略
+
+## 本地运行
 
 ```bash
-# 安装到当前项目（在 git 仓库根目录执行）
-mkdir -p .claude/skills
-git clone https://github.com/perkfly/ex-skill .claude/skills/create-ex
-
-# 或安装到全局（所有项目都能用）
-git clone https://github.com/perkfly/ex-skill ~/.claude/skills/create-ex
+npm install
+npm run dev
 ```
 
-### OpenClaw
+访问：
 
-```bash
-git clone https://github.com/perkfly/ex-skill ~/.openclaw/workspace/skills/create-ex
+```text
+http://localhost:3000
 ```
 
-### 依赖（可选）
+## 部署到 Vercel
 
-```bash
-pip3 install -r requirements.txt
-```
+1. 上传到 GitHub
+2. 导入 Vercel
+3. 配置环境变量
+4. 部署
 
----
+至少需要：
 
-## 使用
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `AI_API_KEY`
+- `AI_MODEL`
 
-在 Claude Code 中输入：
+如果需要图片理解，再额外配置：
 
-```
-/create-ex
-```
+- `AI_VISION_MODEL`
 
-按提示输入她的昵称、关系信息（如 `在一起三年 大学同学 分手一年`）、性格标签，然后选择数据来源。所有字段均可跳过，仅凭描述也能生成。
+## 隐私提示
 
-完成后用 `/{slug}` 调用该前任 Skill。
-
-### 管理命令
-
-| 命令 | 说明 |
-|------|------|
-| `/list-exes` | 列出所有前任 Skill |
-| `/{slug}` | 调用完整 Skill（Persona + Memories） |
-| `/{slug}-memories` | 仅共同记忆 |
-| `/{slug}-persona` | 仅人物性格 |
-| `/ex-rollback {slug} {version}` | 回滚到历史版本 |
-| `/delete-ex {slug}` | 删除 |
-
----
-
-## 效果示例
-
-> 输入：`ENFP 双子座 焦虑型 爱撒娇 翻旧账 嘴上说不在意其实比谁都在意`
-
-**场景一：日常聊天**
-
-```
-用户      > 在干嘛呢
-
-前任.skill > 刚下班
-           > 好累啊今天
-           > 你呢 怎么这个点才找我 🥺
-```
-
-**场景二：惹她生气了**
-
-```
-用户      > 不好意思刚才在忙
-
-前任.skill > 哦
-           > （过了5分钟）
-           > 你每次都说在忙
-           > 上次也是这样
-```
-
-**场景三：撒娇**
-
-```
-用户      > 想吃什么
-
-前任.skill > 随便啊
-用户      > 那吃面？
-前任.skill > 不想吃面
-用户      > 火锅？
-前任.skill > 嘿嘿你怎么知道的 💕
-```
-
----
-
-## 功能特性
-
-### 生成的 Skill 结构
-
-每个前任 Skill 由两部分组成：
-
-| 部分 | 内容 |
-|------|------|
-| **Part A — 共同记忆** | 关系时间线、日常仪式、偏好习惯、情感模式 |
-| **Part B — Persona** | 5 层性格结构：硬规则 → 身份 → 表达风格 → 情感逻辑 → 关系行为 |
-
-运行逻辑：`收到消息 → Persona 判断心情和态度 → Memories 提供记忆细节 → 用她的语气输出`
-
-### 支持的标签
-
-**恋爱性格**：爱撒娇 · 冷暴力 · 翻旧账 · 黏人 · 独立 · 细腻敏感 · 忽冷忽热 · 作 · 玻璃心 · 控制欲强 …
-
-**吵架模式**：冷战派 · 爆发派 · 讲道理派 · 先道歉型 · 死不认错
-
-**依恋类型**：安全型 · 焦虑型 · 回避型 · 混乱型
-
-**爱的表达**：言语肯定 · 服务行为 · 送礼物 · 肢体接触 · 高质量陪伴
-
-### 进化机制
-
-- **追加聊天记录** → 自动分析增量 → merge 进对应部分，不覆盖已有结论
-- **对话纠正** → 说「她不会这样，她应该是 xxx」→ 写入 Correction 层，立即生效
-- **版本管理** → 每次更新自动存档，支持回滚到任意历史版本
-
----
-
-## 项目结构
-
-```
-ex-skill/
-├── SKILL.md              # skill 入口（AgentSkills 标准 frontmatter）
-├── prompts/              # Prompt 模板
-│   ├── intake.md         #   对话式信息录入
-│   ├── memories_analyzer.md #  共同记忆提取
-│   ├── persona_analyzer.md  #  性格行为提取（含标签翻译表）
-│   ├── memories_builder.md  #  memories.md 生成模板
-│   ├── persona_builder.md   #  persona.md 五层结构模板
-│   ├── merger.md            #  增量 merge 逻辑
-│   └── correction_handler.md # 对话纠正处理
-├── tools/                # Python 工具
-│   ├── wechat_parser.py       # 微信聊天记录解析
-│   ├── imessage_parser.py     # iMessage 解析
-│   ├── sms_parser.py          # 短信解析
-│   ├── photo_analyzer.py      # 照片 EXIF 元数据分析
-│   ├── social_media_parser.py # 社交媒体解析
-│   ├── skill_writer.py        # Skill 文件管理
-│   └── version_manager.py     # 版本存档与回滚
-├── exes/                 # 生成的前任 Skill（gitignored）
-├── docs/PRD.md
-├── requirements.txt
-└── LICENSE
-```
-
----
-
-## 注意事项
-
-- **聊天记录质量决定 Skill 质量**：真实聊天记录 > 仅手动描述
-- 建议优先收集：她**主动发的**长消息 > **情感类消息** > 日常消息
-- 照片分析只提取元数据（日期/位置），不上传照片内容
-- 所有数据仅在本地处理，不会发送到任何外部服务
-
----
-
-<div align="center">
-
-MIT License © [perkfly](https://github.com/perkfly)
-
-</div>
+- 聊天记录可能包含隐私，请确认你有权上传
+- 建议先删除敏感内容后再导入
+- 默认只保存总结后的记忆，不长期暴露原始聊天记录
+- AI女友会自然参考这些记忆，但不会机械复述隐私内容

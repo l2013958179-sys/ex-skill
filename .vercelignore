@@ -1,0 +1,9 @@
+.env.local
+.env*
+!.env.local.example
+.next
+node_modules
+.next-dev.err.log
+.next-dev.out.log
+backend
+frontend
