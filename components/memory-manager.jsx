@@ -1,5 +1,9 @@
 "use client";
 
+import { useState } from "react";
+
+import CollapsiblePanel from "@/components/ui/CollapsiblePanel";
+import GradientButton from "@/components/ui/GradientButton";
 import { MEMORY_LABELS, MEMORY_TYPES, buildMemorySummaryText } from "@/lib/memory/profile";
 
 export default function MemoryManager({
@@ -8,24 +12,28 @@ export default function MemoryManager({
   loading,
   storageMode,
   notice,
+  extraPanel,
   onImport,
   onChange,
   onDelete,
   onClear,
 }) {
   const summaryText = buildMemorySummaryText(items);
+  const [isExpanded, setIsExpanded] = useState(true);
 
   return (
-    <section className="settings-card memory-card">
-      <div className="section-heading">
-        <div>
-          <p className="eyebrow">记忆管理</p>
-          <h3>让 AI女友更懂你，但只记住提炼后的重点</h3>
-        </div>
-        <span className="settings-tip">
-          {storageMode === "cloud" ? "当前记忆会同步到 Supabase" : "当前记忆保存在本地浏览器"}
-        </span>
-      </div>
+    <CollapsiblePanel
+      eyebrow="记忆管理"
+      title="让恋爱助手更懂你，但只记住提炼后的重点"
+      description="导入聊天记录后，AI 会提炼长期偏好、相处方式和重要线索。"
+      meta={isExpanded ? (storageMode === "cloud" ? "当前记忆会同步到 Supabase" : "当前记忆保存在本地浏览器") : ""}
+      icon="✦"
+      isExpanded={isExpanded}
+      onToggle={() => setIsExpanded((current) => !current)}
+      className="memory-card"
+      theme="romance"
+    >
+      {extraPanel || null}
 
       <div className="memory-warning">
         <strong>隐私提醒</strong>
@@ -33,7 +41,7 @@ export default function MemoryManager({
       </div>
 
       <div className="memory-toolbar">
-        <label className={`primary-button file-button${disabled ? " is-disabled" : ""}`}>
+        <label className={`ui-button file-button${disabled ? " is-disabled" : ""}`} data-variant="primary" data-size="md" data-theme="romance">
           导入微信聊天记录
           <input
             type="file"
@@ -49,14 +57,14 @@ export default function MemoryManager({
           />
         </label>
 
-        <button
-          type="button"
-          className="secondary-button"
+        <GradientButton
+          variant="secondary"
           onClick={onClear}
           disabled={disabled || loading || !items.length}
+          theme="romance"
         >
           删除全部记忆
-        </button>
+        </GradientButton>
       </div>
 
       {notice ? <p className="memory-notice">{notice}</p> : null}
@@ -82,14 +90,15 @@ export default function MemoryManager({
               <div className="memory-item-head">
                 <strong>{MEMORY_LABELS[memoryType]}</strong>
                 {matched?.content ? (
-                  <button
-                    type="button"
-                    className="ghost-button"
+                  <GradientButton
+                    variant="ghost"
+                    size="sm"
                     onClick={() => onDelete(memoryType)}
                     disabled={disabled || loading}
+                    theme="romance"
                   >
                     删除
-                  </button>
+                  </GradientButton>
                 ) : null}
               </div>
 
@@ -109,6 +118,6 @@ export default function MemoryManager({
           );
         })}
       </div>
-    </section>
+    </CollapsiblePanel>
   );
 }

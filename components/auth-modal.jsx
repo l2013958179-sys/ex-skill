@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 
+import GradientButton from "@/components/ui/GradientButton";
+
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
@@ -64,9 +66,9 @@ export default function AuthModal({ isOpen, initialMode = "login", loading, erro
             <p className="eyebrow">账号</p>
             <h3>{mode === "login" ? "登录账号" : "注册账号"}</h3>
           </div>
-          <button type="button" className="ghost-button" onClick={onClose}>
+          <GradientButton variant="ghost" size="sm" onClick={onClose}>
             关闭
-          </button>
+          </GradientButton>
         </div>
 
         <div className="auth-switcher">
@@ -90,6 +92,7 @@ export default function AuthModal({ isOpen, initialMode = "login", loading, erro
           <label className="field-group">
             <span>邮箱</span>
             <input
+              name="email"
               type="email"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
@@ -101,6 +104,7 @@ export default function AuthModal({ isOpen, initialMode = "login", loading, erro
           <label className="field-group">
             <span>密码</span>
             <input
+              name="password"
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
@@ -119,9 +123,9 @@ export default function AuthModal({ isOpen, initialMode = "login", loading, erro
           {localError ? <p className="auth-error">{localError}</p> : null}
           {error ? <p className="auth-error">{error}</p> : null}
 
-          <button type="submit" className="primary-button auth-submit" disabled={loading}>
+          <GradientButton type="submit" className="auth-submit" disabled={loading}>
             {loading ? "处理中..." : mode === "login" ? "登录" : "注册"}
-          </button>
+          </GradientButton>
         </form>
       </div>
     </div>

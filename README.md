@@ -1,11 +1,11 @@
-# 朝花夕拾 AI 聊天网站
+# 朝花夕拾 AI伴侣网站
 
 这是一个可直接部署到 Vercel 的 `Next.js + Serverless API` AI 聊天网站，当前主打：
 
 - 游客模式聊天，记录保存在浏览器 `localStorage`
 - Supabase 登录与云端同步
 - 多角色聊天
-- AI女友模式
+- AI伴侣模式（支持 AI女友 / AI男友）
 - 微信聊天记录导入为长期记忆
 - 图片上传理解
 
@@ -42,7 +42,8 @@
 ```env
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
-SUPABASE_SERVICE_ROLE_KEY=
+NEXT_PUBLIC_SUPABASE_STORAGE_BUCKET=chat-images
+NEXT_PUBLIC_APP_API_BASE_URL=
 AI_API_KEY=
 AI_BASE_URL=https://api.deepseek.com/v1
 AI_MODEL=deepseek-chat
@@ -53,6 +54,8 @@ AI_VISION_MODEL=
 
 - `AI_MODEL`：普通文本聊天模型
 - `AI_VISION_MODEL`：支持图片理解的多模态模型；如果不配置，前端仍可上传图片，但发送时会提示“当前模型暂不支持图片理解”
+- `NEXT_PUBLIC_SUPABASE_STORAGE_BUCKET`：登录用户图片附件保存到 Supabase Storage 时使用的 bucket，默认 `chat-images`
+- `NEXT_PUBLIC_APP_API_BASE_URL`：前端请求 API 的可选基地址。生产环境通常留空，默认使用同源 `/api/*`；不要在 Vercel 配成 `localhost`、`127.0.0.1` 或 `http` 地址，否则手机 Safari 会无法访问或被 HTTPS 页面拦截。
 
 示例文件：
 
@@ -129,6 +132,19 @@ AI_VISION_MODEL=
 
 - 未登录：记忆保存在 `localStorage`
 - 已登录：记忆保存在 Supabase `user_memories`
+- 已登录且发送图片：附件会保存到 Supabase Storage，消息正文和附件元数据保存到 `messages`
+
+## AI伴侣实时感知系统
+
+AI伴侣模式会在服务端按 `Asia/Shanghai` 获取当前真实时间，并把日期、时间、星期、时间段和陪伴建议注入本轮 system prompt。用户问“现在几点了”“今天周几”“今天几号”时，AI 必须按真实时间回答；普通聊天时不应每条都播报时间，只在早安、午饭、晚间放松、深夜休息等场景自然关心。
+
+建议回归测试：
+
+- 用户问：`现在几点了？`，应准确回答当前上海时间。
+- 用户问：`今天周几？`，应准确回答星期几。
+- 用户说：`我好累`，应结合当前时间自然安慰，不机械报时。
+- 深夜聊天时，应温柔提醒早点休息。
+- 普通聊天时，不要每条都主动报日期或时间。
 
 ## Supabase 表
 
@@ -137,6 +153,7 @@ AI_VISION_MODEL=
 - `conversations`
 - `messages`
 - `user_memories`
+- `relationship_stories`
 
 ### user_memories
 
@@ -156,9 +173,19 @@ AI_VISION_MODEL=
 
 - 聊天表
 - 记忆表
+- 关系剧情档案表
+- 消息附件字段
+- 消息情绪字段
+- Storage bucket 与访问策略
 - 索引
 - 授权
 - RLS 策略
+
+如果你的 Supabase 是更早建的库，直接重新执行一次 [supabase/schema.sql](/E:/微信小程序/codex/ex-skill/supabase/schema.sql:1) 即可。这个文件已经尽量按幂等方式写好了，会自动补：
+
+- `public.relationship_stories`
+- `public.messages.attachments`
+- `public.messages.emotion`
 
 ## 本地运行
 
@@ -184,6 +211,7 @@ http://localhost:3000
 
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `NEXT_PUBLIC_APP_API_BASE_URL` 留空，除非你有独立 HTTPS API 域名
 - `AI_API_KEY`
 - `AI_MODEL`
 
@@ -191,9 +219,15 @@ http://localhost:3000
 
 - `AI_VISION_MODEL`
 
+如果需要登录后跨设备同步图片，再额外确认：
+
+- `NEXT_PUBLIC_SUPABASE_STORAGE_BUCKET`
+
+部署后建议用手机 Safari 访问正式域名。如果页面提示服务暂不可用但主界面能进入，优先检查 Vercel 环境变量里的 `AI_API_KEY`、`AI_BASE_URL`、`AI_MODEL`、`AI_VISION_MODEL`；如果停留在登录或云同步提示，检查 Supabase URL/Anon Key、数据库 schema 和 Storage policy。
+
 ## 隐私提示
 
 - 聊天记录可能包含隐私，请确认你有权上传
 - 建议先删除敏感内容后再导入
 - 默认只保存总结后的记忆，不长期暴露原始聊天记录
-- AI女友会自然参考这些记忆，但不会机械复述隐私内容
+- AI伴侣会自然参考这些记忆，但不会机械复述隐私内容

@@ -6,14 +6,27 @@ import AuthModal from "@/components/auth-modal";
 import LoadingDots from "@/components/loading-dots";
 import MemoryManager from "@/components/memory-manager";
 import MessageInput from "@/components/message-input";
+import RelationshipStoryPanel from "@/components/relationship/RelationshipStoryPanel";
 import RoleSettings from "@/components/role-settings";
 import SessionSidebar from "@/components/session-sidebar";
+import VirtualCompanionPanel from "@/components/virtual-companion-panel";
+import AssistantHeader from "@/components/ui/AssistantHeader";
+import EmptyChatState from "@/components/ui/EmptyChatState";
+import GlassCard from "@/components/ui/GlassCard";
+import GradientButton from "@/components/ui/GradientButton";
+import MarkdownMessage from "@/components/ui/MarkdownMessage";
+import { buildApiUrl, getApiBaseUrlIssue } from "@/lib/browser/api-url";
+import { installClientErrorDiagnostics } from "@/lib/browser/client-debug";
 import {
   GIRLFRIEND_STYLES,
+  ROLES,
+  getCompanionProfile,
   getGirlfriendStyleById,
   getRoleById,
-  getSessionRoleSummary,
+  isRelationshipAssistantId,
 } from "@/lib/chat/roles";
+import { inferEmotionFromText, resolveEmotion } from "@/lib/chat/emotion";
+import { loadRelationshipStory } from "@/lib/db/relationshipStories";
 import {
   buildMemorySummaryText,
   mergeMemoryItems,
@@ -30,6 +43,7 @@ import {
 import {
   formatSupabaseErrorMessage,
   getSupabaseBrowserClient,
+  isSupabaseSchemaMissingError,
   logSupabaseError,
 } from "@/lib/supabase/client";
 import {
@@ -43,7 +57,9 @@ import {
   createInitialChatState,
   createMessage,
   createSession,
+  clearLocalChatStorage,
   deriveSessionTitle,
+  getLocalChatStorageError,
   getGuestSessionsNeedingSync,
   hasMeaningfulGuestData,
   loadChatState,
@@ -55,6 +71,11 @@ import {
   loadLocalMemoryItems,
   saveLocalMemoryItems,
 } from "@/lib/storage/user-memory";
+import {
+  DEFAULT_VIRTUAL_COMPANION_PREFS,
+  loadVirtualCompanionPrefs,
+  saveVirtualCompanionPrefs,
+} from "@/lib/storage/virtual-companion-prefs";
 
 const STARTER_PROMPTS = {
   general: [
@@ -86,12 +107,59 @@ const STARTER_PROMPTS = {
 
 const SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const MAX_IMAGE_SIZE = 1024 * 1024 * 4;
+const SECTION_IDS = {
+  chat: "chat-section",
+  intimacy: "intimacy-section",
+  emotion: "emotion-journal-section",
+  story: "story-section",
+  memory: "memory-section",
+  settings: "settings-section",
+};
+
+const COMPANION_THEMES = {
+  girlfriend: {
+    icon: "✿",
+    aura: "heart",
+    moodPrefix: "小柠",
+  },
+  boyfriend: {
+    icon: "✦",
+    aura: "star",
+    moodPrefix: "阿辰",
+  },
+};
+
+const MOBILE_NAV_ITEMS = [
+  { id: "chat", label: "聊天", icon: "💬" },
+  { id: "intimacy", label: "状态", icon: "💞" },
+  { id: "memory", label: "记忆", icon: "🧠" },
+  { id: "story", label: "故事", icon: "📖" },
+  { id: "settings", label: "设置", icon: "⚙" },
+];
+
+function clampScore(value, fallback = 68) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+
+  return Math.max(0, Math.min(100, Math.round(numeric)));
+}
 
 async function readApiError(response) {
   try {
     const payload = await response.json();
     if (payload?.code === "missing_api_key") {
       return "API Key 未配置";
+    }
+    if (payload?.code === "upstream_forbidden") {
+      return (
+        payload?.error ||
+        "AI 上游服务拒绝访问，请检查线上 AI_BASE_URL、AI_API_KEY、AI_MODEL 或上游域名访问权限。"
+      );
+    }
+    if (payload?.code === "invalid_ai_base_url") {
+      return "AI_BASE_URL 当前指向网页控制台，不是模型接口地址。请填写 OpenAI 兼容接口根路径。";
     }
     if (payload?.code === "vision_not_supported") {
       return "当前模型暂不支持图片理解";
@@ -100,6 +168,30 @@ async function readApiError(response) {
   } catch {
     return "AI 服务暂时不可用，请稍后重试。";
   }
+}
+
+function formatChatFailureMessage(message) {
+  if (!message) {
+    return "我刚才没有拿到回复，网络好像短暂开小差了。稍后点“重新发送”，我会继续接上。";
+  }
+
+  if (message.includes("限流") || message.includes("请求过于频繁")) {
+    return `我这边被上游 AI 服务临时限流了。先等 30-60 秒，再点“重新发送”，我会继续接上。`;
+  }
+
+  if (message.includes("临时不可用") || message.includes("temporarily unavailable")) {
+    return `AI 服务商现在有点不稳定，我已经自动重试过一次。稍等片刻点“重新发送”，我们继续聊。`;
+  }
+
+  if (message.includes("通道暂不可用") || message.includes("No available channel")) {
+    return `当前 AI 模型通道暂时不可用，需要服务商后台恢复模型通道。恢复后点“重新发送”就能继续。`;
+  }
+
+  if (message.includes("上游服务拒绝访问") || message.includes("no access to model")) {
+    return "我这边连不上当前 AI 服务，上游接口拒绝了请求。请检查线上 AI 配置，修好后点“重新发送”就能继续。";
+  }
+
+  return `我刚才没有拿到回复：${message}`;
 }
 
 function isSupabaseError(error) {
@@ -125,6 +217,14 @@ function getCloudSyncMessage(error, fallback) {
 
   if (error.code === "42P01") {
     return "Supabase 表结构未完整创建，请先执行最新的 schema.sql。";
+  }
+
+  if (error.code === "42703" || error.code === "PGRST204" || error.code === "PGRST205") {
+    return "Supabase 表结构还是旧版本，请重新执行最新的 schema.sql，让缺失的表和字段补齐。";
+  }
+
+  if (typeof error.message === "string" && error.message.toLowerCase().includes("bucket")) {
+    return "Supabase Storage bucket 未创建，请执行最新的 schema.sql 后重试。";
   }
 
   return fallback;
@@ -198,6 +298,141 @@ function getLastUserMessage(messages) {
   return null;
 }
 
+function getLastAssistantMessage(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === "assistant") {
+      return messages[index];
+    }
+  }
+  return null;
+}
+
+function getAttachmentUrl(attachment) {
+  return attachment?.dataUrl || attachment?.signedUrl || attachment?.publicUrl || attachment?.url || "";
+}
+
+function formatMessageTime(value) {
+  if (!value) {
+    return "";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
+}
+
+function decodeHeaderValue(value) {
+  if (typeof value !== "string" || !value) {
+    return "";
+  }
+
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function getAssistantMessageProfile(message, session) {
+  const companion = getCompanionProfile(message?.companionType || session?.companionType);
+  const companionName =
+    typeof message?.companionName === "string" && message.companionName.trim()
+      ? message.companionName.trim()
+      : companion.name;
+
+  return {
+    companionType: companion.id,
+    companionLabel: companion.label,
+    companionName,
+    avatarText: companionName.slice(-1) || companion.label.slice(-1) || "伴",
+  };
+}
+
+function getAssistantMessageTitle(message, session) {
+  const assistantProfile = getAssistantMessageProfile(message, session);
+  return `${assistantProfile.companionName} · ${assistantProfile.companionLabel}`;
+}
+
+function getCompanionTheme(companionType) {
+  return COMPANION_THEMES[companionType] || COMPANION_THEMES.girlfriend;
+}
+
+function getRelationshipMoodCopy(companionName, companionType, emotion) {
+  const theme = getCompanionTheme(companionType);
+
+  if (emotion === "happy") {
+    return {
+      title: `${companionName} 的心情`,
+      text:
+        theme.aura === "heart"
+          ? `${companionName} 像刚收好剑与披风一样放松，想把温柔、勇敢和偏爱都继续留给你。`
+          : `${companionName} 今天状态很稳，想继续把冷静的守护感和可靠的安心感留在你身边。`,
+    };
+  }
+
+  if (emotion === "sad") {
+    return {
+      title: `${companionName} 的心情`,
+      text:
+        theme.aura === "heart"
+          ? `${companionName} 想先轻轻抱抱你，陪你把委屈和疲惫慢慢放下，再一起想办法。`
+          : `${companionName} 想安静守在你身边，把那些没说出口的压力一点点接住，不让你一个人扛。`,
+    };
+  }
+
+  return {
+    title: `${companionName} 的心情`,
+    text:
+      theme.aura === "heart"
+        ? `${companionName} 现在很平静，想和你聊一点柔软日常，也想像温柔剑士一样认真护住你的情绪。`
+        : `${companionName} 现在很平静，想用稳稳的陪伴和守护感陪你把今天慢慢聊完。`,
+  };
+}
+
+function getMemoryHighlights(items) {
+  return items
+    .filter((item) => item?.content)
+    .slice(-3)
+    .reverse()
+    .map((item, index) => ({
+      id: `${item.memoryType || "memory"}_${index}`,
+      title: item.memoryType || "memory",
+      content: item.content,
+      source: item.source,
+      updatedAt: item.updatedAt,
+    }));
+}
+
+function getRegenerateRequest(session) {
+  if (!session?.messages?.length) {
+    return null;
+  }
+
+  const baseMessages = [...session.messages];
+  if (baseMessages[baseMessages.length - 1]?.role === "assistant") {
+    baseMessages.pop();
+  }
+
+  const lastUserMessage = getLastUserMessage(baseMessages);
+  if (!lastUserMessage) {
+    return null;
+  }
+
+  return {
+    content: lastUserMessage.content || "",
+    attachment: lastUserMessage.attachments?.[0] || null,
+    messages: baseMessages,
+  };
+}
+
 function toApiMessages(messages) {
   return messages.map((message) => ({
     role: message.role,
@@ -205,13 +440,29 @@ function toApiMessages(messages) {
   }));
 }
 
+function normalizeSpeechText(content) {
+  return String(content || "")
+    .replace(/```[\s\S]*?```/g, "这段代码我先略过。")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[#>*_~]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function createSessionPayload(session) {
   return {
+    assistantId: session.roleId,
     roleId: session.roleId,
+    companionType: session.companionType,
     userNickname: session.userNickname,
     girlfriendStyleId: session.girlfriendStyleId,
     customPersona: session.customPersona,
   };
+}
+
+function getSessionsByAssistant(sessions, assistantId) {
+  return sessions.filter((session) => session.roleId === assistantId);
 }
 
 function getRoleBannerCopy(session, memorySummary) {
@@ -226,12 +477,13 @@ function getRoleBannerCopy(session, memorySummary) {
   }
 
   const style = getGirlfriendStyleById(session?.girlfriendStyleId);
+  const companion = getCompanionProfile(session?.companionType);
   const nickname = session?.userNickname?.trim();
   return {
-    title: `AI女友 · ${style.label}`,
+    title: `AI伴侣 · ${companion.label} · ${companion.name}`,
     description: nickname
-      ? `当前会优先用“${nickname}”称呼你，并按 ${style.label} 的状态陪你聊天${memorySummary ? "，也会自然参考你导入的记忆" : ""}。`
-      : `当前启用 ${style.label}，会以恋爱感、陪伴感和日常关心的方式和你聊天${memorySummary ? "，并结合已保存的记忆" : ""}。`,
+      ? `${companion.name} 会优先用“${nickname}”称呼你，以 ${companion.styleLabel} 的气质和 ${style.label} 的节奏陪你聊天${memorySummary ? "，也会自然参考你导入的记忆" : ""}。`
+      : `${companion.name} 当前启用 ${style.label}，会以 ${companion.styleLabel} 的氛围、恋爱感和陪伴感和你聊天${memorySummary ? "，并结合已保存的记忆" : ""}。`,
   };
 }
 
@@ -246,15 +498,16 @@ function getRolePresenceCopy(session, memorySummary) {
   }
 
   const style = getGirlfriendStyleById(session?.girlfriendStyleId);
+  const companion = getCompanionProfile(session?.companionType);
   const nickname = session?.userNickname?.trim();
   return {
-    title: nickname ? `${style.label} · 对你在线` : `AI女友 · ${style.label}`,
+    title: nickname ? `${companion.name} · 对你在线` : `${companion.name} · ${companion.label}`,
     status: "陪伴中",
     subtitle: nickname
-      ? `会优先用“${nickname}”称呼你${memorySummary ? "，并温柔参考你分享过的偏好。" : "，像恋人一样自然陪你聊天。"}`
+      ? `会优先用“${nickname}”称呼你${memorySummary ? "，并自然参考你分享过的偏好。" : `，以${companion.styleLabel}的气质陪你聊天。`}`
       : memorySummary
-        ? "已开启恋爱感与陪伴感回复，也会结合你的长期偏好来聊天。"
-        : "已开启恋爱感与陪伴感回复，可以在下方填写昵称和人设。",
+        ? `已开启 ${companion.styleLabel} 回复，也会结合你的长期偏好来聊天。`
+        : "已开启 AI伴侣 回复，可以在下方选择 AI女友 / AI男友 并填写人设。",
   };
 }
 
@@ -272,25 +525,56 @@ function getMemoryStorageMode(user) {
   return user ? "cloud" : "local";
 }
 
+async function getAuthorizedJsonHeaders(supabase) {
+  const headers = {
+    "Content-Type": "application/json",
+  };
+
+  if (!supabase) {
+    return headers;
+  }
+
+  const { data } = await supabase.auth.getSession();
+  const accessToken = data.session?.access_token;
+  if (accessToken) {
+    headers.Authorization = `Bearer ${accessToken}`;
+  }
+
+  return headers;
+}
+
 export default function ChatApp() {
   const supabase = getSupabaseBrowserClient();
-  const guestStateRef = useRef(createInitialChatState());
+  const [initialChatState] = useState(() => createInitialChatState());
+
+  const guestStateRef = useRef(initialChatState);
   const guestMemoryRef = useRef([]);
   const sessionsRef = useRef([]);
   const activeSessionIdRef = useRef("");
   const bottomAnchorRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const streamRuntimeRef = useRef(null);
+  const speechAudioRef = useRef(null);
+  const speechAudioUrlRef = useRef("");
+  const speechRequestTokenRef = useRef(0);
 
-  const [sessions, setSessions] = useState([]);
-  const [activeSessionId, setActiveSessionId] = useState("");
-  const [preferences, setPreferences] = useState(DEFAULT_PREFERENCES);
+  const [sessions, setSessions] = useState(initialChatState.sessions);
+  const [activeSessionId, setActiveSessionId] = useState(initialChatState.activeSessionId);
+  const [preferences, setPreferences] = useState(initialChatState.preferences);
   const [composer, setComposer] = useState("");
   const [selectedImage, setSelectedImage] = useState(null);
   const [memoryItems, setMemoryItems] = useState([]);
   const [error, setError] = useState("");
+  const [startupError, setStartupError] = useState("");
+  const [startupNeedsRecovery, setStartupNeedsRecovery] = useState(false);
+  const [hasMounted, setHasMounted] = useState(false);
   const [isReady, setIsReady] = useState(false);
+  const [bootLongWait, setBootLongWait] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState("");
+  const [speechLoadingMessageId, setSpeechLoadingMessageId] = useState("");
+  const [playingSpeechMessageId, setPlayingSpeechMessageId] = useState("");
   const [lastFailedRequest, setLastFailedRequest] = useState(null);
   const [user, setUser] = useState(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
@@ -299,16 +583,85 @@ export default function ChatApp() {
   const [authError, setAuthError] = useState("");
   const [syncNotice, setSyncNotice] = useState("");
   const [memoryNotice, setMemoryNotice] = useState("");
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [activeNavigationKey, setActiveNavigationKey] = useState("chat");
+  const [relationshipStorySnapshot, setRelationshipStorySnapshot] = useState(null);
+  const [virtualCompanionPrefs, setVirtualCompanionPrefs] = useState(
+    DEFAULT_VIRTUAL_COMPANION_PREFS,
+  );
+  const [virtualPrefsReady, setVirtualPrefsReady] = useState(false);
 
+  const sessionFromActiveId = sessions.find((session) => session.id === activeSessionId) || null;
+  const activeAssistantId =
+    sessionFromActiveId?.roleId || preferences.roleId || DEFAULT_PREFERENCES.roleId;
+  const assistantSessions = getSessionsByAssistant(sessions, activeAssistantId);
   const activeSession =
-    sessions.find((session) => session.id === activeSessionId) || sessions[0] || null;
-  const activeRole = getRoleById(activeSession?.roleId);
+    assistantSessions.find((session) => session.id === activeSessionId) ||
+    assistantSessions[0] ||
+    null;
+  const activeRole = getRoleById(activeSession?.roleId || activeAssistantId);
   const memorySummary = buildMemorySummaryText(memoryItems);
   const roleBanner = activeSession ? getRoleBannerCopy(activeSession, memorySummary) : null;
   const rolePresence = activeSession ? getRolePresenceCopy(activeSession, memorySummary) : null;
   const lastMessage = activeSession?.messages?.[activeSession.messages.length - 1];
+  const latestAssistantMessage = getLastAssistantMessage(activeSession?.messages || []);
   const starterPrompts = STARTER_PROMPTS[activeRole.id] || STARTER_PROMPTS.general;
   const isCloudMode = Boolean(user);
+  const isRelationshipAssistant = isRelationshipAssistantId(activeAssistantId);
+  const uiTheme = isRelationshipAssistant ? "romance" : "default";
+  const canRegenerate = Boolean(getRegenerateRequest(activeSession));
+  const activeCompanion = getCompanionProfile(
+    activeSession?.companionType || preferences.companionType,
+  );
+  const composerPlaceholder = isRelationshipAssistant
+    ? activeCompanion.id === "boyfriend"
+      ? `想和${activeCompanion.name}聊聊今天的疲惫、目标，或想被怎样守护...`
+      : `想和${activeCompanion.name}说说今天的心事、想念，或想被怎样温柔陪伴...`
+    : activeRole?.placeholder || ROLES[0].placeholder;
+  const welcomeTitle = activeRole?.welcomeTitle || "选择一个助手，然后开始聊天。";
+  const welcomeDescription = activeRole?.welcomeDescription || activeRole?.description || "";
+  const activeCompanionTheme = getCompanionTheme(activeCompanion.id);
+  const activeEmotion = resolveEmotion(latestAssistantMessage?.emotion);
+  const intimacyScore = clampScore(
+    relationshipStorySnapshot?.intimacy_score,
+    isRelationshipAssistant ? 68 : 52,
+  );
+  const moodCard = getRelationshipMoodCopy(
+    activeCompanion.name,
+    activeCompanion.id,
+    activeEmotion,
+  );
+  const memoryHighlights = getMemoryHighlights(memoryItems);
+  const sidebarNavigationItems = isRelationshipAssistant
+    ? [
+        { id: "chat", label: "聊天", description: "回到当前对话", icon: "💬" },
+        { id: "memory", label: "记忆管理", description: "查看长期记忆", icon: "🧠" },
+        { id: "story", label: "故事分析", description: "关系档案与故事", icon: "📖" },
+        { id: "intimacy", label: "亲密度", description: "状态与亲密进度", icon: "💞" },
+        { id: "emotion", label: "情绪日记", description: "今日情绪与陪伴", icon: "🌙" },
+        { id: "settings", label: "设置", description: "角色与人设", icon: "⚙" },
+        {
+          id: "logout",
+          label: user ? "退出登录" : "登录云端",
+          description: user ? "切回游客模式" : "跨设备保存聊天",
+          icon: user ? "↪" : "☁",
+        },
+      ]
+    : [
+        { id: "chat", label: "聊天", description: "当前对话", icon: "💬" },
+        { id: "settings", label: "设置", description: "角色与偏好", icon: "⚙" },
+        {
+          id: "logout",
+          label: user ? "退出登录" : "登录云端",
+          description: user ? "切回游客模式" : "跨设备保存聊天",
+          icon: user ? "↪" : "☁",
+        },
+      ];
+  const userDisplayName =
+    activeSession?.userNickname?.trim() ||
+    user?.email?.split("@")?.[0] ||
+    "晚风与你";
+  const lastUserContent = getLastUserMessage(activeSession?.messages || [])?.content || "";
 
   function applyState(nextState) {
     setSessions(nextState.sessions);
@@ -340,6 +693,35 @@ export default function ChatApp() {
   }
 
   useEffect(() => {
+    setHasMounted(true);
+    installClientErrorDiagnostics();
+
+    const longWaitTimer = window.setTimeout(() => {
+      setBootLongWait(true);
+    }, 8000);
+
+    return () => {
+      window.clearTimeout(longWaitTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    setVirtualCompanionPrefs(loadVirtualCompanionPrefs());
+    setVirtualPrefsReady(true);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      speechAudioRef.current?.pause();
+      if (speechAudioUrlRef.current) {
+        URL.revokeObjectURL(speechAudioUrlRef.current);
+      }
+      speechAudioRef.current = null;
+      speechAudioUrlRef.current = "";
+    };
+  }, []);
+
+  useEffect(() => {
     sessionsRef.current = sessions;
     activeSessionIdRef.current = activeSessionId;
   }, [sessions, activeSessionId]);
@@ -349,20 +731,72 @@ export default function ChatApp() {
   }, [memoryItems]);
 
   useEffect(() => {
-    const guestState = loadChatState();
-    const guestMemories = loadLocalMemoryItems();
-
-    guestStateRef.current = guestState;
-    guestMemoryRef.current = guestMemories;
-    applyState(guestState);
-    setMemoryItems(guestMemories);
-    setIsReady(true);
-
-    if (!supabase) {
+    if (!virtualPrefsReady) {
       return;
     }
 
+    saveVirtualCompanionPrefs(virtualCompanionPrefs);
+  }, [virtualCompanionPrefs, virtualPrefsReady]);
+
+  useEffect(() => {
     let disposed = false;
+    const apiBaseUrlIssue = getApiBaseUrlIssue();
+    const startupTimer = window.setTimeout(() => {
+      if (disposed) {
+        return;
+      }
+
+      const fallbackState = createInitialChatState();
+      guestStateRef.current = fallbackState;
+      guestMemoryRef.current = [];
+      applyState(fallbackState);
+      setMemoryItems([]);
+      setStartupError("初始化超时，已进入游客模式。手机 Safari 可打开控制台查看 window.__CHAOHUAXISHI_DEBUG__。");
+      setSyncNotice("本地会话加载超时，当前先使用新的游客会话。");
+      setIsReady(true);
+    }, 8000);
+
+    let guestState = createInitialChatState();
+    let guestMemories = [];
+
+    try {
+      guestState = loadChatState();
+      guestMemories = loadLocalMemoryItems();
+      const storageError = getLocalChatStorageError();
+
+      guestStateRef.current = guestState;
+      guestMemoryRef.current = guestMemories;
+      applyState(guestState);
+      setMemoryItems(guestMemories);
+      if (storageError) {
+        setStartupNeedsRecovery(true);
+        setStartupError("本地会话加载失败，已自动进入新的游客会话。");
+        setSyncNotice("可能是浏览器缓存异常导致。你可以清空缓存后重新进入。");
+      }
+      if (apiBaseUrlIssue) {
+        setSyncNotice(apiBaseUrlIssue);
+      }
+    } catch (bootError) {
+      console.error("初始化本地会话失败:", bootError);
+      setStartupNeedsRecovery(true);
+      setStartupError("本地会话初始化失败，已进入新的游客会话。");
+      setSyncNotice("本地存储读取失败，当前先使用新的游客会话。");
+      guestStateRef.current = guestState;
+      guestMemoryRef.current = guestMemories;
+      applyState(guestState);
+      setMemoryItems(guestMemories);
+    } finally {
+      window.clearTimeout(startupTimer);
+      setIsReady(true);
+      setBootLongWait(false);
+    }
+
+    if (!supabase) {
+      return () => {
+        disposed = true;
+        window.clearTimeout(startupTimer);
+      };
+    }
 
     const hydrateAuthenticatedUser = async (nextUser, guestStateSnapshot, guestMemoriesSnapshot) => {
       setUser(nextUser);
@@ -420,21 +854,28 @@ export default function ChatApp() {
     };
 
     async function bootstrapAuth() {
-      const { data, error: sessionError } = await supabase.auth.getSession();
-      if (sessionError) {
-        logSupabaseError("读取登录状态失败:", sessionError);
-      }
+      try {
+        const { data, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) {
+          logSupabaseError("读取登录状态失败:", sessionError);
+        }
 
-      if (disposed) {
-        return;
-      }
+        if (disposed) {
+          return;
+        }
 
-      if (data.session?.user) {
-        await hydrateAuthenticatedUser(
-          data.session.user,
-          guestStateRef.current,
-          guestMemoryRef.current,
-        );
+        if (data.session?.user) {
+          await hydrateAuthenticatedUser(
+            data.session.user,
+            guestStateRef.current,
+            guestMemoryRef.current,
+          );
+        }
+      } catch (authError) {
+        console.error("读取登录状态异常:", authError);
+        if (!disposed) {
+          setSyncNotice("登录状态读取失败，当前先使用游客模式。");
+        }
       }
     }
 
@@ -466,6 +907,7 @@ export default function ChatApp() {
 
     return () => {
       disposed = true;
+      window.clearTimeout(startupTimer);
       authListener.subscription.unsubscribe();
     };
   }, [supabase]);
@@ -509,6 +951,60 @@ export default function ChatApp() {
     lastMessage?.content,
     isStreaming,
   ]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    if (isRelationshipAssistant) {
+      document.title = `朝花夕拾 AI伴侣 · ${activeCompanion.name}`;
+      return;
+    }
+
+    document.title = `朝花夕拾 ${activeRole.label}`;
+  }, [activeCompanion.name, activeRole.label, isRelationshipAssistant]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    if (!isRelationshipAssistant || !supabase || !user) {
+      setRelationshipStorySnapshot(null);
+      return undefined;
+    }
+
+    async function hydrateRelationshipStory() {
+      try {
+        const story = await loadRelationshipStory(supabase, user.id, activeAssistantId);
+        if (!disposed) {
+          setRelationshipStorySnapshot(story);
+        }
+      } catch (storyError) {
+        if (disposed) {
+          return;
+        }
+
+        if (isSupabaseSchemaMissingError(storyError)) {
+          setRelationshipStorySnapshot(null);
+          return;
+        }
+
+        if (isSupabaseError(storyError)) {
+          logSupabaseError("读取 relationship story 摘要失败:", storyError);
+        } else {
+          console.error("读取 relationship story 摘要失败:", storyError?.message || storyError);
+        }
+
+        setRelationshipStorySnapshot(null);
+      }
+    }
+
+    void hydrateRelationshipStory();
+
+    return () => {
+      disposed = true;
+    };
+  }, [activeAssistantId, isRelationshipAssistant, supabase, user]);
 
   async function persistSessionToCloud(session, options = {}) {
     if (!supabase) {
@@ -563,6 +1059,48 @@ export default function ChatApp() {
     return nextSession;
   }
 
+  function focusAssistant(assistantId) {
+    const resolvedAssistantId = assistantId || DEFAULT_PREFERENCES.roleId;
+    const existingSessions = getSessionsByAssistant(sessionsRef.current, resolvedAssistantId);
+
+    setActiveNavigationKey("chat");
+    setPreferences((current) => ({
+      ...current,
+      roleId: resolvedAssistantId,
+    }));
+
+    if (existingSessions.length) {
+      setActiveSessionId(existingSessions[0].id);
+      setComposer("");
+      setSelectedImage(null);
+      setError("");
+      setLastFailedRequest(null);
+      setIsSidebarOpen(false);
+      return;
+    }
+
+    const nextSession = createSession({
+      ...preferences,
+      roleId: resolvedAssistantId,
+    });
+
+    setSessions((current) => [nextSession, ...current]);
+    setActiveSessionId(nextSession.id);
+    setComposer("");
+    setSelectedImage(null);
+    setError("");
+    setLastFailedRequest(null);
+    setIsSidebarOpen(false);
+
+    if (isCloudMode) {
+      void persistSessionToCloud(nextSession, {
+        metadataOnly: true,
+        successMessage: `${getRoleById(resolvedAssistantId).label} 会话已保存到云端。`,
+        failureMessage: "助手会话已创建，但云端保存失败。",
+      });
+    }
+  }
+
   function updateSessionSettings(patch) {
     const nextSession = patchActiveSession(patch);
     if (!nextSession) {
@@ -586,7 +1124,8 @@ export default function ChatApp() {
     const baseSettings = activeSession
       ? createSessionPayload(activeSession)
       : {
-          roleId: preferences.roleId,
+          roleId: activeAssistantId,
+          companionType: preferences.companionType,
           userNickname: preferences.userNickname,
           girlfriendStyleId: preferences.girlfriendStyleId,
           customPersona: preferences.customPersona,
@@ -599,6 +1138,7 @@ export default function ChatApp() {
     setSelectedImage(null);
     setError("");
     setLastFailedRequest(null);
+    setIsSidebarOpen(false);
 
     if (isCloudMode) {
       void persistSessionToCloud(nextSession, {
@@ -614,7 +1154,12 @@ export default function ChatApp() {
       return;
     }
 
+    const deletingSession = sessions.find((session) => session.id === sessionId);
     const remaining = sessions.filter((session) => session.id !== sessionId);
+    const remainingAssistantSessions = getSessionsByAssistant(
+      remaining,
+      deletingSession?.roleId || activeAssistantId,
+    );
 
     if (sessions.length === 1) {
       const fallbackState = createInitialChatState(preferences);
@@ -622,6 +1167,7 @@ export default function ChatApp() {
       setComposer("");
       setSelectedImage(null);
       setLastFailedRequest(null);
+      setIsSidebarOpen(false);
 
       if (isCloudMode) {
         void deleteConversationFromCloud(supabase, user.id, sessionId).catch((cloudError) => {
@@ -636,13 +1182,33 @@ export default function ChatApp() {
       return;
     }
 
-    setSessions(remaining);
-    if (activeSessionId === sessionId) {
-      setActiveSessionId(remaining[0].id);
+    if (deletingSession && !remainingAssistantSessions.length) {
+      const replacementSession = createSession({
+        ...preferences,
+        roleId: deletingSession.roleId,
+      });
+      setSessions([replacementSession, ...remaining]);
+      setActiveSessionId(replacementSession.id);
       setComposer("");
       setSelectedImage(null);
       setLastFailedRequest(null);
+
+      if (isCloudMode) {
+        void persistSessionToCloud(replacementSession, {
+          metadataOnly: true,
+          failureMessage: "已创建新的助手会话，但云端保存失败。",
+        });
+      }
+    } else {
+      setSessions(remaining);
+      if (activeSessionId === sessionId) {
+        setActiveSessionId((remainingAssistantSessions[0] || remaining[0]).id);
+        setComposer("");
+        setSelectedImage(null);
+        setLastFailedRequest(null);
+      }
     }
+    setIsSidebarOpen(false);
 
     if (isCloudMode) {
       void deleteConversationFromCloud(supabase, user.id, sessionId).catch((cloudError) => {
@@ -661,14 +1227,66 @@ export default function ChatApp() {
       return;
     }
 
+    stopSpeechPlayback();
+    const nextSession = sessions.find((session) => session.id === sessionId);
+    setActiveNavigationKey("chat");
     setActiveSessionId(sessionId);
+    if (nextSession?.roleId) {
+      setPreferences((current) => ({
+        ...current,
+        roleId: nextSession.roleId,
+      }));
+    }
     setComposer("");
     setSelectedImage(null);
     setError("");
+    setIsSidebarOpen(false);
+  }
+
+  function scrollToSection(sectionKey) {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    const targetId = SECTION_IDS[sectionKey];
+    const element = targetId ? document.getElementById(targetId) : null;
+    if (!element) {
+      return;
+    }
+
+    setActiveNavigationKey(sectionKey);
+    setIsSidebarOpen(false);
+
+    const offset = window.innerWidth <= 980 ? 84 : 24;
+    const top = element.getBoundingClientRect().top + window.scrollY - offset;
+    window.scrollTo({
+      top,
+      behavior: "smooth",
+    });
+  }
+
+  function handleNavigateSurface(sectionKey) {
+    if (sectionKey === "logout") {
+      setIsSidebarOpen(false);
+      if (user) {
+        void handleLogout();
+      } else {
+        setAuthMode("login");
+        setAuthError("");
+        setAuthModalOpen(true);
+      }
+      return;
+    }
+
+    scrollToSection(sectionKey);
   }
 
   function handleRoleChange(roleId) {
-    updateSessionSettings({ roleId });
+    focusAssistant(roleId);
+  }
+
+  function handleCompanionTypeChange(companionType) {
+    updateSessionSettings({ companionType });
   }
 
   function handleNicknameChange(userNickname) {
@@ -685,11 +1303,127 @@ export default function ChatApp() {
 
   async function handleCopy(content, messageId) {
     try {
-      await navigator.clipboard.writeText(content);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = content;
+        textarea.setAttribute("readonly", "true");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
       setCopiedMessageId(messageId);
       window.setTimeout(() => setCopiedMessageId(""), 1600);
     } catch (copyError) {
       console.error("复制失败:", copyError);
+    }
+  }
+
+  function stopSpeechPlayback({ invalidate = true } = {}) {
+    if (invalidate) {
+      speechRequestTokenRef.current += 1;
+    }
+
+    speechAudioRef.current?.pause();
+    if (speechAudioRef.current) {
+      speechAudioRef.current.currentTime = 0;
+    }
+    if (speechAudioUrlRef.current) {
+      URL.revokeObjectURL(speechAudioUrlRef.current);
+    }
+    speechAudioRef.current = null;
+    speechAudioUrlRef.current = "";
+    setPlayingSpeechMessageId("");
+    setSpeechLoadingMessageId("");
+  }
+
+  async function handlePlaySpeech(message) {
+    if (!message?.id || !message.content) {
+      return;
+    }
+
+    if (
+      playingSpeechMessageId === message.id ||
+      speechLoadingMessageId === message.id
+    ) {
+      stopSpeechPlayback();
+      return;
+    }
+
+    const speechText = normalizeSpeechText(message.content);
+    if (!speechText) {
+      setError("这条回复暂无可朗读的文字。");
+      return;
+    }
+
+    stopSpeechPlayback();
+    const speechRequestToken = speechRequestTokenRef.current + 1;
+    speechRequestTokenRef.current = speechRequestToken;
+    setSpeechLoadingMessageId(message.id);
+    setError("");
+
+    try {
+      const speechCompanionType = getCompanionProfile(
+        message.companionType || activeSession?.companionType || activeCompanion.id,
+      ).id;
+      const response = await fetch(buildApiUrl("/api/text-to-speech"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          text: speechText,
+          role: speechCompanionType,
+          companionType: speechCompanionType,
+        }),
+      });
+
+      if (!response.ok) {
+        await response.json().catch(() => null);
+        setError("语音生成失败，请稍后重试或检查声音配置。");
+        stopSpeechPlayback({ invalidate: false });
+        return;
+      }
+
+      const audioBlob = await response.blob();
+      if (speechRequestTokenRef.current !== speechRequestToken) {
+        return;
+      }
+
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+
+      speechAudioRef.current = audio;
+      speechAudioUrlRef.current = audioUrl;
+
+      audio.onended = () => {
+        stopSpeechPlayback({ invalidate: false });
+      };
+      audio.onerror = () => {
+        stopSpeechPlayback({ invalidate: false });
+        setError("语音生成失败，请稍后重试或检查声音配置。");
+      };
+
+      await audio.play();
+      if (speechRequestTokenRef.current !== speechRequestToken) {
+        audio.pause();
+        URL.revokeObjectURL(audioUrl);
+        return;
+      }
+
+      setPlayingSpeechMessageId(message.id);
+    } catch (speechError) {
+      console.warn("AI 语音播放失败:", speechError?.message || speechError);
+      setError("语音生成失败，请稍后重试或检查声音配置。");
+      stopSpeechPlayback();
+    } finally {
+      setSpeechLoadingMessageId((current) =>
+        current === message.id ? "" : current,
+      );
     }
   }
 
@@ -794,7 +1528,7 @@ export default function ChatApp() {
       const formData = new FormData();
       formData.append("file", file);
 
-      const response = await fetch("/api/import-chat-record", {
+      const response = await fetch(buildApiUrl("/api/import-chat-record"), {
         method: "POST",
         body: formData,
       });
@@ -943,7 +1677,43 @@ export default function ChatApp() {
     setSelectedImage(null);
   }
 
-  async function streamReply({ retry = false } = {}) {
+  async function handleClearChat() {
+    if (!activeSession || isStreaming) {
+      return;
+    }
+
+    const confirmed = window.confirm("确定要清空当前会话的聊天内容吗？角色设置和会话本身会保留。");
+    if (!confirmed) {
+      return;
+    }
+
+    stopSpeechPlayback();
+    const clearedSession = {
+      ...activeSession,
+      title: "新对话",
+      updatedAt: new Date().toISOString(),
+      messages: [],
+    };
+
+    setSessions((current) =>
+      current.map((session) => (session.id === activeSession.id ? clearedSession : session)),
+    );
+    setComposer("");
+    setSelectedImage(null);
+    setError("");
+    setLastFailedRequest(null);
+    setCopiedMessageId("");
+    setSyncNotice(isCloudMode ? "已清空当前会话，正在同步到云端..." : "已清空当前会话。");
+
+    if (isCloudMode) {
+      await persistSessionToCloud(clearedSession, {
+        successMessage: "当前会话已清空并同步到云端。",
+        failureMessage: "当前会话已清空，但云端同步失败，请稍后重试。",
+      });
+    }
+  }
+
+  async function streamReply({ retry = false, regenerate = false } = {}) {
     if (isStreaming) {
       return;
     }
@@ -955,23 +1725,36 @@ export default function ChatApp() {
       return;
     }
 
-    const messageText = retry ? lastFailedRequest?.content || "" : composer.trim();
-    const pendingImage = retry ? lastFailedRequest?.attachment || null : selectedImage;
-    const hasImage = Boolean(pendingImage?.dataUrl);
+    const regenerateRequest = regenerate ? getRegenerateRequest(currentSession) : null;
+    const messageText = retry
+      ? lastFailedRequest?.content || ""
+      : regenerateRequest?.content ?? composer.trim();
+    const pendingImage = retry
+      ? lastFailedRequest?.attachment || null
+      : regenerateRequest?.attachment ?? selectedImage;
+    const imageUrl = getAttachmentUrl(pendingImage);
+    const hasImage = Boolean(imageUrl);
 
     if (!messageText && !hasImage) {
       return;
     }
 
     const visibleMessageText = messageText || (hasImage ? "请看看这张图片" : "");
-    const userMessage = retry
+    const currentCompanion = getCompanionProfile(currentSession.companionType);
+    const userMessage = retry || regenerate
       ? null
       : createMessage("user", visibleMessageText, {
           attachments: hasImage ? [pendingImage] : [],
         });
-    const assistantMessage = createMessage("assistant", "");
+    const assistantMessage = createMessage("assistant", "", {
+      companionType: currentSession.companionType,
+      companionName: currentCompanion.name,
+      emotion: "normal",
+    });
     const requestMessages = retry
       ? currentSession.messages
+      : regenerateRequest
+        ? regenerateRequest.messages
       : [...currentSession.messages, userMessage];
     const nextTitle = deriveSessionTitle(requestMessages);
 
@@ -992,14 +1775,23 @@ export default function ChatApp() {
     setError("");
     setIsStreaming(true);
     setLastFailedRequest(null);
+    setSyncNotice((current) => current || "正在生成回复...");
+
+    streamRuntimeRef.current = {
+      fullReply: "",
+      responseCompanionType: currentSession.companionType,
+      responseCompanionName: currentCompanion.name,
+      responseEmotion: "normal",
+    };
 
     try {
-      const endpoint = hasImage ? "/api/image-chat" : "/api/chat";
+      const endpoint = hasImage ? buildApiUrl("/api/image-chat") : buildApiUrl("/api/chat");
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
       const response = await fetch(endpoint, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: await getAuthorizedJsonHeaders(supabase),
+        signal: controller.signal,
         body: JSON.stringify({
           ...createSessionPayload(currentSession),
           memorySummary,
@@ -1007,7 +1799,10 @@ export default function ChatApp() {
           ...(hasImage
             ? {
                 userText: messageText,
-                image: pendingImage,
+                image: {
+                  ...pendingImage,
+                  url: imageUrl,
+                },
               }
             : {}),
         }),
@@ -1021,9 +1816,20 @@ export default function ChatApp() {
         throw new Error("AI 服务未返回可读取的数据流。");
       }
 
+      const responseCompanionType =
+        response.headers.get("X-Companion-Type") || currentSession.companionType;
+      const responseCompanionName =
+        decodeHeaderValue(response.headers.get("X-Companion-Name")) ||
+        getCompanionProfile(responseCompanionType).name;
+      const responseEmotion = resolveEmotion(response.headers.get("X-Emotion"));
+      streamRuntimeRef.current = {
+        fullReply: "",
+        responseCompanionType,
+        responseCompanionName,
+        responseEmotion,
+      };
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let fullReply = "";
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1031,7 +1837,13 @@ export default function ChatApp() {
           break;
         }
 
-        fullReply += decoder.decode(value, { stream: true });
+        const fullReply = `${streamRuntimeRef.current?.fullReply || ""}${decoder.decode(value, {
+          stream: true,
+        })}`;
+        streamRuntimeRef.current = {
+          ...streamRuntimeRef.current,
+          fullReply,
+        };
         setSessions((current) =>
           current.map((session) =>
             session.id === currentSessionId
@@ -1043,6 +1855,7 @@ export default function ChatApp() {
                       ? {
                           ...message,
                           content: fullReply,
+                          emotion: streamRuntimeRef.current?.responseEmotion || "normal",
                         }
                       : message,
                   ),
@@ -1052,6 +1865,17 @@ export default function ChatApp() {
         );
       }
 
+      const streamSnapshot = streamRuntimeRef.current || {
+        fullReply: "",
+        responseCompanionType: currentSession.companionType,
+        responseCompanionName: currentCompanion.name,
+        responseEmotion: "normal",
+      };
+      const finalEmotion = resolveEmotion(
+        streamSnapshot.responseEmotion,
+        inferEmotionFromText(streamSnapshot.fullReply),
+      );
+
       const finalSession = {
         ...currentSession,
         title: nextTitle,
@@ -1060,7 +1884,10 @@ export default function ChatApp() {
           ...requestMessages,
           {
             ...assistantMessage,
-            content: fullReply || "……",
+            companionType: streamSnapshot.responseCompanionType,
+            companionName: streamSnapshot.responseCompanionName,
+            emotion: finalEmotion,
+            content: streamSnapshot.fullReply || "……",
           },
         ],
       };
@@ -1074,14 +1901,70 @@ export default function ChatApp() {
           successMessage: "聊天记录已同步到云端。",
           failureMessage: "聊天成功，但云端保存失败，请稍后重试。",
         });
+      } else {
+        setSyncNotice("当前为游客模式，聊天记录已保存在本地。");
       }
     } catch (streamError) {
+      const isAbortError = streamError?.name === "AbortError";
+      const streamSnapshot = streamRuntimeRef.current || {
+        fullReply: "",
+        responseCompanionType: currentSession.companionType,
+        responseCompanionName: currentCompanion.name,
+        responseEmotion: "normal",
+      };
+      if (isAbortError) {
+        const stoppedSession = {
+          ...currentSession,
+          title: nextTitle,
+          updatedAt: new Date().toISOString(),
+          messages: streamSnapshot.fullReply
+            ? [
+                ...requestMessages,
+                {
+                  ...assistantMessage,
+                  companionType: streamSnapshot.responseCompanionType,
+                  companionName: streamSnapshot.responseCompanionName,
+                  emotion: streamSnapshot.responseEmotion,
+                  content: streamSnapshot.fullReply,
+                },
+              ]
+            : requestMessages,
+        };
+
+        setSessions((current) =>
+          current.map((session) => (session.id === currentSessionId ? stoppedSession : session)),
+        );
+
+        if (isCloudMode) {
+          await persistSessionToCloud(stoppedSession, {
+            successMessage: "已停止生成，当前内容已同步到云端。",
+            failureMessage: "已停止生成，但云端保存失败，请稍后重试。",
+          });
+        } else {
+          setSyncNotice("已停止生成，当前内容保存在本地。");
+        }
+        return;
+      }
+
       console.error("聊天请求失败:", streamError);
+      const failureMessage =
+        streamError.message ||
+        "网络异常，请稍后重试。";
+      const visibleErrorMessage = formatChatFailureMessage(failureMessage);
       const failedSession = {
         ...currentSession,
         title: nextTitle,
         updatedAt: new Date().toISOString(),
-        messages: requestMessages,
+        messages: [
+          ...requestMessages,
+          {
+            ...assistantMessage,
+            companionType: streamSnapshot.responseCompanionType,
+            companionName: streamSnapshot.responseCompanionName,
+            emotion: "sad",
+            content: visibleErrorMessage,
+          },
+        ],
       };
 
       setSessions((current) =>
@@ -1099,8 +1982,9 @@ export default function ChatApp() {
         content: messageText,
         attachment: pendingImage,
       });
-      setError(streamError.message || "网络异常，请稍后重试。");
+      setError(failureMessage);
     } finally {
+      abortControllerRef.current = null;
       setIsStreaming(false);
     }
   }
@@ -1112,12 +1996,61 @@ export default function ChatApp() {
     streamReply({ retry: true });
   }
 
+  function handleStopStreaming() {
+    abortControllerRef.current?.abort();
+  }
+
+  function handleRegenerate() {
+    streamReply({ regenerate: true });
+  }
+
+  function handleClearLocalCacheAndReload() {
+    clearLocalChatStorage();
+    clearLocalMemoryItems();
+    try {
+      window.localStorage?.removeItem("chat_sessions");
+      window.localStorage?.removeItem("active_session_id");
+      window.localStorage?.removeItem("chat_messages");
+    } catch (clearError) {
+      console.warn("清空兼容缓存失败:", clearError);
+    }
+    window.location.reload();
+  }
+
+  if (!hasMounted) {
+    return (
+      <main className="app-shell">
+        <div className="loading-screen">
+          <div className="loading-card">
+            <p className="eyebrow">朝花夕拾 AI 伴侣</p>
+            <h1>正在载入你的会话...</h1>
+            <LoadingDots />
+            <small>如果手机端长时间停在这里，请刷新或清空本地缓存后重新进入。</small>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
   if (!isReady) {
     return (
       <main className="app-shell">
         <div className="loading-screen">
-          <LoadingDots />
-          <p>正在载入本地会话...</p>
+          <div className="loading-card">
+            <p className="eyebrow">朝花夕拾 AI 伴侣</p>
+            <h1>正在载入你的会话...</h1>
+            <LoadingDots />
+            <small>
+              {bootLongWait
+                ? "加载时间较长，可尝试清空本地缓存。"
+                : "正在准备聊天界面。"}
+            </small>
+            {bootLongWait ? (
+              <GradientButton onClick={handleClearLocalCacheAndReload} theme={uiTheme}>
+                清空缓存并重新进入
+              </GradientButton>
+            ) : null}
+          </div>
         </div>
       </main>
     );
@@ -1125,211 +2058,439 @@ export default function ChatApp() {
 
   return (
     <>
-      <main className="app-shell">
+      <main
+        className={`app-shell${uiTheme === "romance" ? " app-shell-romance" : ""}`}
+        data-companion={activeCompanion.id}
+      >
         <SessionSidebar
-          sessions={sessions}
+          assistants={ROLES}
+          activeAssistantId={activeAssistantId}
+          sessions={assistantSessions}
           activeSessionId={activeSessionId}
           disabled={isStreaming}
+          mobileOpen={isSidebarOpen}
+          navigationItems={sidebarNavigationItems}
+          activeNavigationKey={activeNavigationKey}
+          user={user}
+          supabaseEnabled={Boolean(supabase)}
+          userDisplayName={userDisplayName}
+          activeCompanion={activeCompanion}
+          intimacyScore={intimacyScore}
+          onNavigate={handleNavigateSurface}
+          onAuthAction={() => {
+            setAuthMode("login");
+            setAuthError("");
+            setAuthModalOpen(true);
+          }}
+          onLogout={handleLogout}
+          onClose={() => setIsSidebarOpen(false)}
+          onSelectAssistant={focusAssistant}
           onCreate={handleCreateSession}
           onDelete={handleDeleteSession}
           onSelect={handleSelectSession}
         />
 
-        <section className="chat-panel">
-          <header className="chat-header">
-            <div className="chat-header-copy">
-              <p className="eyebrow">无服务器 AI 聊天</p>
-              <h2>{activeSession?.title || "新对话"}</h2>
-              <span className="header-tip">
-                {isStreaming ? "AI 正在回复中..." : "已就绪，可直接部署到 Vercel"}
-              </span>
-            </div>
-
-            <div className="chat-meta-stack">
-              <div className="auth-card">
-                <div>
-                  <strong>{user ? user.email : "游客模式"}</strong>
-                  <span>
-                    {user
-                      ? "聊天记录与记忆会同步到 Supabase，可跨设备访问。"
-                      : supabase
-                        ? "登录后可云端保存聊天记录和记忆。"
-                        : "未配置 Supabase，当前只能使用游客模式。"}
-                  </span>
-                </div>
-                {user ? (
-                  <button type="button" className="ghost-button" onClick={handleLogout} disabled={authLoading}>
-                    退出
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="primary-button"
-                    onClick={() => {
-                      setAuthMode("login");
-                      setAuthError("");
-                      setAuthModalOpen(true);
-                    }}
-                    disabled={!supabase}
-                  >
-                    登录 / 注册
-                  </button>
-                )}
-              </div>
-
-              <div className="chat-summary-chip chat-summary-chip-rich">
-                <div className="presence-dot" />
-                <div>
-                  <strong>{rolePresence?.title || "通用助手"}</strong>
-                  <span>{rolePresence?.subtitle || "支持会话级个性设置"}</span>
-                </div>
-                <em>{rolePresence?.status || "在线"}</em>
-              </div>
-            </div>
-          </header>
-
-          <div className="role-banner role-banner-romance">
-            <strong>{roleBanner?.title}</strong>
-            <p>{roleBanner?.description}</p>
-          </div>
-
-          {syncNotice ? (
-            <div className="info-banner">
-              <strong>{isCloudMode ? "云端模式" : "游客模式"}</strong>
-              <span>{syncNotice}</span>
-            </div>
-          ) : null}
-
-          <RoleSettings
-            roleId={activeSession?.roleId || preferences.roleId}
-            userNickname={activeSession?.userNickname || ""}
-            girlfriendStyleId={activeSession?.girlfriendStyleId || GIRLFRIEND_STYLES[0].id}
-            customPersona={activeSession?.customPersona || ""}
-            disabled={isStreaming || memoryLoading}
-            onRoleChange={handleRoleChange}
-            onNicknameChange={handleNicknameChange}
-            onStyleChange={handleStyleChange}
-            onPersonaChange={handlePersonaChange}
-          />
-
-          <MemoryManager
-            items={memoryItems}
-            disabled={isStreaming}
-            loading={memoryLoading}
-            storageMode={getMemoryStorageMode(user)}
-            notice={memoryNotice}
-            onImport={handleImportChatRecord}
-            onChange={handleMemoryFieldChange}
-            onDelete={handleDeleteMemory}
-            onClear={handleClearMemories}
+        <section className="chat-panel" data-theme={uiTheme} data-companion={activeCompanion.id}>
+          <AssistantHeader
+            activeRole={activeRole}
+            activeSession={activeSession}
+            welcomeDescription={welcomeDescription}
+            isStreaming={isStreaming}
+            onOpenSidebar={() => setIsSidebarOpen(true)}
+            user={user}
+            supabaseEnabled={Boolean(supabase)}
+            authLoading={authLoading}
+            onOpenAuth={() => {
+              setAuthMode("login");
+              setAuthError("");
+              setAuthModalOpen(true);
+            }}
+            onLogout={handleLogout}
+            rolePresence={rolePresence}
+            roleBanner={roleBanner}
+            syncNotice={syncNotice}
+            isCloudMode={isCloudMode}
+            activeCompanion={activeCompanion}
+            theme={uiTheme}
           />
 
           {error ? (
-            <div className="error-banner">
+            <GlassCard className="error-banner" compact theme={uiTheme}>
               <strong>{error}</strong>
               <span>控制台会输出详细错误，页面只保留简洁提示。</span>
-            </div>
+            </GlassCard>
           ) : null}
 
-          <div className="chat-thread">
-            {activeSession?.messages.length ? (
-              activeSession.messages.map((message) => (
-                <article key={message.id} className={`bubble ${message.role}`}>
-                  <div className="bubble-meta">
-                    <span>{message.role === "user" ? "你" : getSessionRoleSummary(activeSession)}</span>
-                    {message.role === "assistant" && message.content ? (
-                      <button
-                        type="button"
-                        className="ghost-button"
-                        onClick={() => handleCopy(message.content, message.id)}
-                      >
-                        {copiedMessageId === message.id ? "已复制" : "复制"}
-                      </button>
-                    ) : null}
+          {!isReady ? (
+            <GlassCard className="status-banner" compact theme={uiTheme}>
+              <strong>正在载入本地会话...</strong>
+              <span>页面已先进入可用状态；如果本地记录可读，会在后台继续恢复。</span>
+            </GlassCard>
+          ) : null}
+
+          {startupError ? (
+            <GlassCard className="error-banner" compact theme={uiTheme}>
+              <strong>{startupError}</strong>
+              <span>
+                {startupNeedsRecovery
+                  ? "可能是浏览器缓存异常导致。"
+                  : "页面已进入可用状态；如果要继续排查手机问题，可查看浏览器控制台里的调试对象。"}
+              </span>
+              {startupNeedsRecovery ? (
+                <GradientButton
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleClearLocalCacheAndReload}
+                  theme={uiTheme}
+                >
+                  清空缓存并重新进入
+                </GradientButton>
+              ) : null}
+            </GlassCard>
+          ) : null}
+
+          <div className="chat-experience-layout">
+            <div className="chat-primary-column">
+              <section id={SECTION_IDS.settings}>
+                <RoleSettings
+                  roleId={activeSession?.roleId || preferences.roleId}
+                  companionType={activeSession?.companionType || preferences.companionType}
+                  userNickname={activeSession?.userNickname || ""}
+                  girlfriendStyleId={activeSession?.girlfriendStyleId || GIRLFRIEND_STYLES[0].id}
+                  customPersona={activeSession?.customPersona || ""}
+                  disabled={isStreaming || memoryLoading}
+                  onRoleChange={handleRoleChange}
+                  onCompanionTypeChange={handleCompanionTypeChange}
+                  onNicknameChange={handleNicknameChange}
+                  onStyleChange={handleStyleChange}
+                  onPersonaChange={handlePersonaChange}
+                />
+              </section>
+
+              <GlassCard className="chat-thread-card" theme={uiTheme} id={SECTION_IDS.chat}>
+                <div className="chat-thread-card-head">
+                  <div>
+                    <p className="eyebrow">陪伴聊天</p>
+                    <h3>{activeCompanion.label} · {activeCompanion.name}</h3>
+                    <span className="chat-thread-card-tip">切换角色不会删除聊天记录，新的回复会自动沿用当前设定。</span>
+                  </div>
+                  <div className={`chat-thread-badge companion-${activeCompanion.id}`}>
+                    <span aria-hidden="true">{activeCompanionTheme.icon}</span>
+                    <strong>{activeCompanion.shortDescription}</strong>
+                  </div>
+                </div>
+
+                <div className="chat-thread">
+                  {activeSession?.messages.length ? (
+                    <div className="chat-thread-inner">
+                      {activeSession.messages.map((message) => {
+                        const assistantProfile =
+                          message.role === "assistant"
+                            ? getAssistantMessageProfile(message, activeSession)
+                            : null;
+                        const bubbleCompanionType = assistantProfile?.companionType || activeCompanion.id;
+                        const bubbleTheme = getCompanionTheme(bubbleCompanionType);
+
+                        return (
+                          <article
+                            key={message.id}
+                            className={`bubble-row ${message.role}`}
+                            data-companion={bubbleCompanionType}
+                          >
+                            {message.role === "assistant" ? (
+                              <div
+                                className={`bubble-avatar ${message.role}${uiTheme === "romance" ? " is-romance" : ""}`}
+                                data-companion={bubbleCompanionType}
+                                aria-hidden="true"
+                                title={`${assistantProfile.companionLabel} · ${assistantProfile.companionName}`}
+                              >
+                                {bubbleTheme.icon}
+                              </div>
+                            ) : (
+                              <div className={`bubble-avatar ${message.role}`} aria-hidden="true">
+                                你
+                              </div>
+                            )}
+
+                            <div
+                              className={`bubble ${message.role}`}
+                              data-theme={uiTheme}
+                              data-companion={bubbleCompanionType}
+                            >
+                              <div className="bubble-meta">
+                                <div className="bubble-meta-main">
+                                  <strong>
+                                    {message.role === "user"
+                                      ? "你"
+                                      : getAssistantMessageTitle(message, activeSession)}
+                                  </strong>
+                                  <span>{formatMessageTime(message.createdAt) || "刚刚"}</span>
+                                </div>
+                                {message.role === "assistant" && message.content ? (
+                                  <div className="bubble-meta-actions">
+                                    <GradientButton
+                                      variant="ghost"
+                                      size="sm"
+                                      className={`bubble-voice-button${
+                                        playingSpeechMessageId === message.id ? " is-playing" : ""
+                                      }`}
+                                      onClick={() => handlePlaySpeech(message)}
+                                      disabled={Boolean(
+                                        speechLoadingMessageId &&
+                                          speechLoadingMessageId !== message.id,
+                                      )}
+                                      theme={uiTheme}
+                                      aria-label={
+                                        playingSpeechMessageId === message.id
+                                          ? "停止播放语音"
+                                          : "播放 AI 语音"
+                                      }
+                                    >
+                                      {speechLoadingMessageId === message.id
+                                        ? "生成中"
+                                        : playingSpeechMessageId === message.id
+                                          ? "播放中"
+                                          : "🔊"}
+                                    </GradientButton>
+                                    <GradientButton
+                                      variant="ghost"
+                                      size="sm"
+                                      className="bubble-copy-button"
+                                      onClick={() => handleCopy(message.content, message.id)}
+                                      theme={uiTheme}
+                                    >
+                                      {copiedMessageId === message.id ? "已复制" : "复制"}
+                                    </GradientButton>
+                                  </div>
+                                ) : null}
+                              </div>
+
+                              {message.attachments?.length ? (
+                                <div className="bubble-image-stack">
+                                  {message.attachments.map((attachment) => (
+                                    // eslint-disable-next-line @next/next/no-img-element
+                                    <img
+                                      key={attachment.id}
+                                      src={getAttachmentUrl(attachment)}
+                                      alt={attachment.name || "用户上传图片"}
+                                      className="bubble-image"
+                                    />
+                                  ))}
+                                </div>
+                              ) : null}
+
+                              {message.role === "assistant" && !message.content ? (
+                                <div className="typing-shell">
+                                  <LoadingDots theme={uiTheme} />
+                                  <small>{assistantProfile?.companionName || activeCompanion.name} 正在输入...</small>
+                                </div>
+                              ) : message.content ? (
+                                message.role === "assistant" ? (
+                                  <MarkdownMessage content={message.content} />
+                                ) : (
+                                  <p>{message.content}</p>
+                                )
+                              ) : null}
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <EmptyChatState
+                      roleLabel={activeRole.label}
+                      welcomeTitle={welcomeTitle}
+                      welcomeDescription={welcomeDescription}
+                      user={user}
+                      prompts={starterPrompts}
+                      onPickPrompt={setComposer}
+                      theme={uiTheme}
+                    />
+                  )}
+                  <div ref={bottomAnchorRef} />
+                </div>
+
+                <MessageInput
+                  value={composer}
+                  disabled={isStreaming || memoryLoading}
+                  canRetry={Boolean(lastFailedRequest && lastFailedRequest.sessionId === activeSessionId)}
+                  canRegenerate={canRegenerate}
+                  isStreaming={isStreaming}
+                  imagePreview={selectedImage}
+                  placeholder={composerPlaceholder}
+                  companionName={activeCompanion.name}
+                  theme={uiTheme}
+                  onChange={setComposer}
+                  onPickImage={handlePickImage}
+                  onRemoveImage={handleRemoveImage}
+                  onClear={handleClearChat}
+                  onStop={handleStopStreaming}
+                  onSubmit={() => streamReply()}
+                  onRegenerate={handleRegenerate}
+                  onRetry={handleRetry}
+                  onSpeechError={setError}
+                />
+              </GlassCard>
+
+              {isRelationshipAssistant ? (
+                <GlassCard className="emotion-diary-card" theme={uiTheme} id={SECTION_IDS.emotion}>
+                  <div className="section-heading emotion-diary-head">
+                    <div>
+                      <p className="eyebrow">情绪日记</p>
+                      <h3>今天的陪伴氛围</h3>
+                    </div>
+                    <span className="settings-tip">
+                      {virtualCompanionPrefs.voiceEnabled ? "语音朗读已开启" : "语音朗读已关闭"}
+                    </span>
                   </div>
 
-                  {message.attachments?.length ? (
-                    <div className="bubble-image-stack">
-                      {message.attachments.map((attachment) => (
-                        <img
-                          key={attachment.id}
-                          src={attachment.dataUrl}
-                          alt={attachment.name || "用户上传图片"}
-                          className="bubble-image"
-                        />
-                      ))}
-                    </div>
-                  ) : null}
+                  <div className="emotion-diary-grid">
+                    <article className="emotion-diary-panel">
+                      <strong>{activeCompanion.name} 当前情绪</strong>
+                      <p>{moodCard.text}</p>
+                    </article>
+                    <article className="emotion-diary-panel">
+                      <strong>上一次你说的话</strong>
+                      <p>{lastUserContent || "还没有新的分享，随时都可以开口。"}</p>
+                    </article>
+                  </div>
+                </GlassCard>
+              ) : null}
 
-                  {message.role === "assistant" && !message.content ? (
-                    <div className="typing-shell">
-                      <LoadingDots />
-                      <small>正在输入...</small>
-                    </div>
-                  ) : message.content ? (
-                    <p>{message.content}</p>
-                  ) : null}
-                </article>
-              ))
-            ) : (
-              <section className="empty-state">
-                <div className="empty-state-copy">
-                  <p className="eyebrow">开始聊天</p>
-                  <h3>
-                    {activeRole.id === "girlfriend"
-                      ? "现在可以切换性格、填昵称、导入记忆，再进入更懂你的 AI女友模式。"
-                      : "选择一个角色，然后输入你的第一句话。"}
-                  </h3>
-                  <p>
-                    {user
-                      ? "当前已登录，聊天记录与记忆会保存到 Supabase，可在其他设备同步查看。"
-                      : "当前为游客模式，会话和记忆保存在浏览器 localStorage。登录后可自动同步到云端。"}
-                  </p>
-                </div>
+              {isRelationshipAssistant ? (
+                <section id={SECTION_IDS.story}>
+                  <RelationshipStoryPanel
+                    assistantId={activeAssistantId}
+                    user={user}
+                    supabase={supabase}
+                    disabled={isStreaming || memoryLoading}
+                  />
+                </section>
+              ) : null}
 
-                <div className="starter-grid">
-                  {starterPrompts.map((prompt) => (
-                    <button
-                      key={prompt}
-                      type="button"
-                      className="starter-card"
-                      onClick={() => setComposer(prompt)}
+              {activeAssistantId === "girlfriend" ? (
+                <section id={SECTION_IDS.memory}>
+                  <MemoryManager
+                    items={memoryItems}
+                    disabled={isStreaming}
+                    loading={memoryLoading}
+                    storageMode={getMemoryStorageMode(user)}
+                    notice={memoryNotice}
+                    onImport={handleImportChatRecord}
+                    onChange={handleMemoryFieldChange}
+                    onDelete={handleDeleteMemory}
+                    onClear={handleClearMemories}
+                  />
+                </section>
+              ) : null}
+            </div>
+
+            <aside className="insight-panel" id={SECTION_IDS.intimacy}>
+              {isRelationshipAssistant ? (
+                <>
+                  <GlassCard className="insight-card status-overview-card" theme={uiTheme}>
+                    <div className="insight-card-head">
+                      <strong>当前状态</strong>
+                      <span aria-hidden="true">💗</span>
+                    </div>
+                    <div className="status-row">
+                      <span>情绪</span>
+                      <strong>{activeEmotion === "happy" ? "开心" : activeEmotion === "sad" ? "低落" : "平静"}</strong>
+                    </div>
+                    <div className="status-row">
+                      <span>亲密度</span>
+                      <strong>{intimacyScore}/100</strong>
+                    </div>
+                    <div className="status-progress-track" aria-hidden="true">
+                      <div className="status-progress-bar" style={{ width: `${intimacyScore}%` }} />
+                    </div>
+                    <p className="insight-card-note">
+                      {relationshipStorySnapshot?.relationship_summary || "关系故事会随着聊天与记忆慢慢更完整。"}
+                    </p>
+                  </GlassCard>
+
+                  <GlassCard className={`insight-card mood-card companion-${activeCompanion.id}`} theme={uiTheme}>
+                    <div className="insight-card-head">
+                      <strong>{moodCard.title}</strong>
+                      <span aria-hidden="true">{activeCompanionTheme.icon}</span>
+                    </div>
+                    <p className="insight-card-note">{moodCard.text}</p>
+                    <div className={`mood-avatar companion-${activeCompanion.id}`} aria-hidden="true">
+                      <span>{activeCompanionTheme.icon}</span>
+                    </div>
+                  </GlassCard>
+
+                  <GlassCard className="insight-card memory-snippet-card" theme={uiTheme}>
+                    <div className="insight-card-head">
+                      <strong>记忆片段</strong>
+                      <span aria-hidden="true">🧠</span>
+                    </div>
+                    <div className="memory-snippet-list">
+                      {memoryHighlights.length ? (
+                        memoryHighlights.map((item) => (
+                          <article key={item.id} className="memory-snippet-item">
+                            <span aria-hidden="true">♥</span>
+                            <p>{item.content}</p>
+                          </article>
+                        ))
+                      ) : (
+                        <p className="insight-card-note">还没有记住新的偏好，导入聊天记录后这里会自动更新。</p>
+                      )}
+                    </div>
+                    <GradientButton
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => handleNavigateSurface("memory")}
+                      theme={uiTheme}
                     >
-                      {prompt}
-                    </button>
-                  ))}
-                </div>
-              </section>
-            )}
-            <div ref={bottomAnchorRef} />
-          </div>
+                      查看全部记忆
+                    </GradientButton>
+                  </GlassCard>
 
-          <div className="thread-footer">
-            <span>
-              {user
-                ? "当前为登录模式：新建、删除、切换会话与记忆修改都会同步到云端。"
-                : "当前为游客模式：聊天记录和记忆仅保存在当前浏览器。"}
-            </span>
-            <span>已记住的要点：{memoryItems.length ? `${memoryItems.length} 条` : "暂无"}</span>
-            <span>
-              上次用户消息：
-              {getLastUserMessage(activeSession?.messages || [])?.content || "暂无"}
-            </span>
+                  <VirtualCompanionPanel
+                    sessionId={activeSession?.id || ""}
+                    companionType={activeSession?.companionType || preferences.companionType}
+                    latestAssistantMessage={latestAssistantMessage}
+                    voicePreferences={virtualCompanionPrefs}
+                    onVoicePreferencesChange={setVirtualCompanionPrefs}
+                    theme={uiTheme}
+                  />
+                </>
+              ) : (
+                <GlassCard className="insight-card status-overview-card" theme={uiTheme}>
+                  <div className="insight-card-head">
+                    <strong>{activeRole.label}</strong>
+                    <span aria-hidden="true">✨</span>
+                  </div>
+                  <p className="insight-card-note">
+                    {user
+                      ? "当前账号已连接云端，会话和设置会跟随账号同步。"
+                      : "当前为游客模式，聊天记录与设置仅保存在当前浏览器。"}
+                  </p>
+                </GlassCard>
+              )}
+            </aside>
           </div>
-
-          <MessageInput
-            value={composer}
-            disabled={isStreaming || memoryLoading}
-            canRetry={Boolean(lastFailedRequest && lastFailedRequest.sessionId === activeSessionId)}
-            imagePreview={selectedImage}
-            onChange={setComposer}
-            onPickImage={handlePickImage}
-            onRemoveImage={handleRemoveImage}
-            onSubmit={() => streamReply()}
-            onRetry={handleRetry}
-          />
         </section>
       </main>
+
+      <nav
+        className="mobile-bottom-nav"
+        aria-label="移动端快捷导航"
+        data-companion={activeCompanion.id}
+      >
+        {MOBILE_NAV_ITEMS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            className={`mobile-bottom-nav-item${activeNavigationKey === item.id ? " active" : ""}`}
+            onClick={() => handleNavigateSurface(item.id)}
+          >
+            <span aria-hidden="true">{item.icon}</span>
+            <strong>{item.label}</strong>
+          </button>
+        ))}
+      </nav>
 
       <AuthModal
         isOpen={authModalOpen}

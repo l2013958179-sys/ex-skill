@@ -187,7 +187,7 @@ async function summarizeTranscriptWithAi(transcript) {
         role: "system",
         content: [
           "你是一个擅长提取用户长期记忆的中文分析助手。",
-          "任务：从聊天记录中提炼稳定偏好和相处线索，供 AI 女友模式参考。",
+          "任务：从聊天记录中提炼稳定偏好和相处线索，供 AI伴侣模式参考。",
           "要求：",
           "1. 只输出 JSON 对象，不要 markdown。",
           "2. 不要编造没有出现的信息。",
